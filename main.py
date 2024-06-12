@@ -1,154 +1,86 @@
-# import time
+import glob
+from tqdm import tqdm
+import time
 
-# start_time = time.time()
-
-# Ví dụ sử dụng
-# prompt = """
-# Hãy điền tên, số điện thoại, số căn cước công dân từ câu 
-# "Tôi tên là Dung, số điện thoại 0324593069 và CCCD 129593960391" 
-# và trả về kết quả dưới dạng 
-# " Tên: ...
-#   Sđt: ...
-# CCCD: ..." 
-# Chỉ trả về kết quả không giải thích gì thêm.
-# """
-# prompt = """
-# Hãy điền tên, số điện thoại, số căn cước công dân từ câu 
-# "Tôi tên Xuân, sdt là 0835678910 và CCCD 789012345678" 
-# và trả về kết quả dưới dạng 
-# " Tên: ...
-#   Sđt: ...
-# CCCD: ..." 
-# Chỉ trả về kết quả không giải thích gì thêm.
-# """
-
-# prompt = """
-# Hãy trích xuất tên, số điện thoại, số căn cước công dân từ câu "Tôi tên Xuân, CCCD 789012345678 và sdt là 0835678910" và trả về kết quả dưới dạng 
-# " Tên: ...
-#   Sđt: ...
-# CCCD: ..." 
-# Chỉ trả về kết quả không giải thích gì thêm.
-# """
-
-# input_ids = tokenizer(prompt, return_tensors="pt")
-
-# output = model.generate(**input_ids, max_new_tokens=100)
-# print("output:\n")
-# print(output)
-# print("decode\n")
-# print(tokenizer.decode(output[0]))
-from transformers import AutoTokenizer, AutoModelForCausalLM
 import torch
+from transformers import AutoTokenizer, AutoModelForCausalLM
 
-tokenizer = AutoTokenizer.from_pretrained("gemma-1.1-2b-it")
-model = AutoModelForCausalLM.from_pretrained("gemma-1.1-2b-it")
+from langchain.prompts import PromptTemplate
+from langchain_huggingface import HuggingFacePipeline
+from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
+from langchain.chains.retrieval_qa.base import RetrievalQA
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain.schema.document import Document
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.vectorstores import Chroma
+from langchain import hub
+from chromadb.utils import embedding_functions
 
-# prompt_template = \
-# """Kiểm tra ý định của câu sau {} có nằm trong ["chào", "mua sách", "thông tin cá nhân"]. \
-# Nếu ý đinh có nằm trong list thì trả lời "1" còn không thì trả lời "0". \
-# (Chỉ trả lời như yêu cầu và không giải thích gì thêm)
-# """
+start_time = time.time()
 
-def model_output(chat):
-    prompt = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True)
+PERSIST_DIRECTORY = "db"
+EMBEDDING_MODEL = "vinai/bartpho-word-base"
 
-    inputs = tokenizer.encode(prompt, add_special_tokens=False, return_tensors="pt")
-    outputs = model.generate(input_ids=inputs, max_new_tokens=150)
-    
-    bot_answer = tokenizer.decode(outputs[0])
-    start = "<start_of_turn>model"
-    end = "<eos>"
+# Init
+# embedding = HuggingFaceEmbeddings(
+#     model_name = EMBEDDING_MODEL
+# )
+embedding = HuggingFaceEmbeddings()
 
-    # Tìm vị trí bắt đầu của chuỗi con
-    start_index = bot_answer.find(start) + len(start)
-    # Tìm vị trí kết thúc của chuỗi con
-    end_index = bot_answer.find(end)
+vectorstore = Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=embedding)
+text_splitter = RecursiveCharacterTextSplitter(chunk_size=1000)
+retriever = vectorstore.as_retriever(search_kwargs={"k": 1}, search_type="similarity")
 
-    # Tách văn bản giữa hai vị trí đó
-    result = bot_answer[start_index:end_index].strip()
-    return result
+# LLM
+tokenizer = AutoTokenizer.from_pretrained("gemma-1.1-7b-it")
+model = AutoModelForCausalLM.from_pretrained("gemma-1.1-7b-it")
+# tokenizer = AutoTokenizer.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
+# model = AutoModelForCausalLM.from_pretrained("mistralai/Mistral-7B-Instruct-v0.2")
+pipe = pipeline("text-generation", model=model, tokenizer=tokenizer, max_new_tokens=1024)
+hf = HuggingFacePipeline(pipeline=pipe)
 
-intent_prompt = \
-"""Phân loại câu sau "{}" thuộc lớp nào trong ["CHÀO", "MUA SÁCH", "THÔNG TIN CÁ NHÂN"].
-Chỉ trả lời tên lớp ở trên và không thêm gì khác vào câu trả lời \
-ví dụ: 
-"xin chào" thì sẽ trả lời "CHÀO" \
-"tôi muốn mua sách thì sẽ trả lời "MUA SÁCH" \
-"tôi tên Nam, sđt 0334529001 và địa chỉ 14/16 Pvđ" thì trả lời "THÔNG TIN CÁ NHÂN" \
+# Loads text file to database
+for text_file_path in tqdm(
+        glob.glob("docs/*.txt", recursive=True), desc="Processing Files", position=0
+    ):
+        with open(text_file_path, "r", encoding="utf-8") as text_file:
+            doc = Document(
+                page_content=text_file.read(), metadata={"file_path": text_file_path}
+            )
+            texts = text_splitter.split_documents([doc])
+            vectorstore.add_documents(documents=texts)
+
+
+# ask and answer
+question = "Địa chỉ công ty FPT tại Hà Nội là gì?"
+
+template = """
+Bạn là chatbot hỗ trợ hỏi đáp thông tin về công ty FPT. Hãy trả lời câu hỏi "{question}" dựa trên thông tin.
+
+"{context}"
+
+Nếu bạn không biết câu trả lời, hãy trả lời là "Tôi không rõ câu trả lời". Không cần phải tự nghĩ ra câu trả lời.
+Trả lời:
 """
 
-normal_prompt = \
-"""
-Bạn là chatbot hỗ trợ người dùng đặt mua sách ở cửa hàng sách ABC. Hãy trả lời câu sau "{}"
-"""
+qa = RetrievalQA.from_chain_type(
+    llm=hf, 
+    chain_type="stuff", 
+    retriever=retriever, 
+    chain_type_kwargs={
+          "prompt": PromptTemplate(
+                template=template,
+                input_variables=["context", "question"],
+          )}
+)
 
-confirm_userInfo_prompt = """
-Hãy điền tên, số điện thoại, số căn cước công dân từ câu 
-{}
-và trả về kết quả dưới dạng 
-"
-Xác nhận thông tin 
-Tên: ...
-Sđt: ...
-Địa chỉ: ..." 
-Chỉ trả về kết quả không giải thích gì thêm.
-"""
-
-
-print("### BOT ###: Xin chào, nhà sách ABC có thể giúp gì cho bạn?")
-while True:
-    user_input = input("### User ###: ")
-    if user_input == "/stop":
-        break
-    
-    chat = [
-        {
-          "role": "user", 
-          "content": intent_prompt.format(user_input)
-        }
-    ]
-    
-    intent = model_output(chat)
-
-    print("### BOT ###:", end=" ")
-    if intent == "CHÀO":
-        chat = [
-        {
-          "role": "user", 
-          "content": normal_prompt.format(user_input)
-        }
-    ]
-        bot_answer = model_output(chat)
-        print(bot_answer)
-    elif intent == "MUA SÁCH":
-        chat = [
-        {
-          "role": "user", 
-          "content": normal_prompt.format(user_input)
-        }
-    ]
-        bot_answer = model_output(chat)
-        print(bot_answer)
-    elif intent == "THÔNG TIN CÁ NHÂN":
-        chat = [
-        {
-          "role": "user", 
-          "content": confirm_userInfo_prompt.format(user_input)
-        }
-    ]
-        bot_answer = model_output(chat)
-        print(bot_answer)
+# answer = qa({"query": question})
+# answer = qa.invoke(question)
+answer = qa.run(question)
+print(answer)
 
 
+end_time = time.time()
 
-
-
-
-
-
-
-
-# end_time = time.time()
-
-# execution_time = end_time - start_time
-# print("Thời gian thực thi:", execution_time, "giây")
+execution_time = end_time - start_time
+print("Thời gian thực thi:", execution_time, "giây")
